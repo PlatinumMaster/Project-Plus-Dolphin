@@ -2,8 +2,8 @@ name: Project+ Dolphin Builder
 
 on:
   push:
-    tags:
-      - 'v*'  # Triggers on tags starting with 'v' (e.g., v1.0)
+    branches:
+      - master
   pull_request:
     branches:
       - master
