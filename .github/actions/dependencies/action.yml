@@ -16,7 +16,7 @@ runs:
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
         case "$RUNNER_OS" in
           Windows) args+=(-G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl) ;;
-          macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64
+          macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
                         -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
                         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON) ;;
           Linux) args+=(-G Ninja -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13) ;;
@@ -52,7 +52,7 @@ runs:
         args=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CONFIGURATION_TYPES=Release)
         case "$RUNNER_OS" in
           Windows) args+=(-G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl) ;;
-          macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64
+          macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
                         -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
                         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON) ;;
           Linux) args+=(-G Ninja -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13) ;;

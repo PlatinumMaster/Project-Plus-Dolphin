@@ -101,9 +101,18 @@ jobs:
         if-no-files-found: error
         
   build_macos:
-    name: macOS Build
-    runs-on: macos-15-intel
+    name: macOS Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     env:
+      MACOS_ARCH: ${{ matrix.arch }}
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: 'true'
@@ -118,6 +127,13 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
+
+      - name: Verify native runner
+        run: |
+          if [ "$(uname -m)" != "$MACOS_ARCH" ]; then
+            echo "::error::Expected a native $MACOS_ARCH runner, got $(uname -m)"
+            exit 1
+          fi
 
       - name: Checkout Unix submodules
         run: |
@@ -145,6 +161,7 @@ jobs:
 
       # Use the same Qt version as the source build, without compiling Qt or
       # the unused SDL2 dependency. SDL3 is in the native dependency bundle.
+      # Qt 6's macOS clang_64 package contains both x86_64 and arm64 slices.
       - name: Install cached Qt binaries
         uses: jurplel/install-qt-action@bcb88e3bed2e992f5f9e24c0f9e364a231d278eb # v4.4.0
         with:
@@ -154,14 +171,18 @@ jobs:
           arch: clang_64
           archives: qtbase qtsvg qttools qttranslations
           cache: 'true'
-          cache-key-prefix: macos-15-intel-qt-v1
+          cache-key-prefix: ${{ matrix.runner }}-qt-v1
 
+      - name: Verify Qt architecture
+        run: lipo -verify_arch "$MACOS_ARCH" "$QT_ROOT_DIR/lib/QtCore.framework/QtCore"
+
+      # Runner labels separate native architectures while preserving Intel caches.
       - name: Cache MoltenVK
         id: cache-moltenvk
         uses: actions/cache/restore@v4
         with:
           path: ~/moltenvk
-          key: macos-15-intel-moltenvk-v2-${{ hashFiles('Externals/MoltenVK/**') }}
+          key: ${{ matrix.runner }}-moltenvk-v2-${{ hashFiles('Externals/MoltenVK/**') }}
 
       - name: Build MoltenVK
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
@@ -183,6 +204,9 @@ jobs:
           popd
           rm -rf mvk-build
 
+      - name: Verify MoltenVK architecture
+        run: lipo -verify_arch "$MACOS_ARCH" "$HOME/moltenvk/lib/libMoltenVK.dylib"
+
       # Save as soon as the dependency succeeds, even if Dolphin later fails.
       - name: Save MoltenVK
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
@@ -196,8 +220,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: macos-15-intel-ccache-v2-${{ github.sha }}-${{ github.run_attempt }}
-          restore-keys: macos-15-intel-ccache-v2-
+          key: ${{ matrix.runner }}-ccache-v2-${{ github.sha }}-${{ github.run_attempt }}
+          restore-keys: ${{ matrix.runner }}-ccache-v2-
 
       - name: Generate CMake Files
         env:
@@ -208,7 +232,8 @@ jobs:
             -DDOLPHIN_DEPENDENCY_PREFIX="$DEPENDENCY_PREFIX"
             -DCMAKE_BUILD_TYPE=Release
             -DUSE_BUNDLED_MOLTENVK=OFF
-            -DMACOS_CODE_SIGNING=OFF
+            -DMACOS_CODE_SIGNING=ON
+            -DMACOS_CODE_SIGNING_IDENTITY=-
             -DPOSTPROCESS_BUNDLE=ON
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
             -DCMAKE_C_COMPILER_LAUNCHER=ccache
@@ -225,13 +250,11 @@ jobs:
             -GNinja
           )
 
-          cmake -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-                -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
-                -DCMAKE_SYSTEM_NAME=Darwin \
-                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.00 \
+          cmake -DCMAKE_OSX_ARCHITECTURES="$MACOS_ARCH" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
                 "${COMMON_ARGS[@]}" \
                 -B build .
-      - name: Build Dolphin (x86_64)
+      - name: Build Dolphin (${{ matrix.arch }})
         id: build
         working-directory: build
         run: |
@@ -260,6 +283,20 @@ jobs:
           path: .ccache
           key: ${{ steps.cache-ccache.outputs.cache-primary-key }}
 
+      - name: Verify macOS bundle
+        shell: bash
+        run: |
+          app=build/Binaries/DolphinQt.app
+          # The executable must be native; bundled universal libraries are fine.
+          test "$(lipo -archs "$app/Contents/MacOS/DolphinQt")" = "$MACOS_ARCH"
+          while IFS= read -r -d '' binary; do
+            case "$(file -b "$binary")" in
+              *Mach-O*) lipo -verify_arch "$MACOS_ARCH" "$binary" ;;
+            esac
+          done < <(find "$app" -type f -print0)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          "$app/Contents/MacOS/DolphinQt" --version
+
       - name: Prepare Build Artifacts
         id: create-artifact
         env:
@@ -278,7 +315,7 @@ jobs:
           else
             SUFFIX="sha[$(git rev-parse --short HEAD)]"
           fi
-          APPNAME="Project-Plus-Dolphin-macOS-$SUFFIX"
+          APPNAME="Project-Plus-Dolphin-macOS-$MACOS_ARCH-$SUFFIX"
           mv build/Binaries/DolphinQt.app "$APPNAME.app"
           tar --options xz:compression-level=9 -cvJf "$APPNAME.tar.xz" "$APPNAME.app"
           echo "name=$APPNAME" >> "$GITHUB_OUTPUT"
