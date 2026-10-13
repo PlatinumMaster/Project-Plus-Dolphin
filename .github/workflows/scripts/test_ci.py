@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -150,7 +151,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(names.index('Verify macOS bundle'), names.index('Prepare Build Artifacts'))
         self.assertLess(names.index('Prepare Build Artifacts'), names.index('Upload Artifact'))
         for name in ('Verify Qt architecture', 'Verify MoltenVK architecture'):
-            self.assertIn('lipo -verify_arch "$MACOS_ARCH"', step(mac, name)['run'])
+            command = step(mac, name)['run']
+            self.assertTrue(command.startswith('lipo "'))
+            self.assertTrue(command.endswith('-verify_arch "$MACOS_ARCH"'))
 
     def test_bash_step_syntax(self):
         jobs = [CI['jobs']['build_macos'], CI['jobs']['build_appimage'], BUNDLE['runs']]
@@ -167,6 +170,39 @@ class MacOSCommandTests(unittest.TestCase):
     def run_bash(self, script, **extra_env):
         return subprocess.run(['bash', '-euo', 'pipefail', '-c', script], text=True,
                               capture_output=True, env={**os.environ, **extra_env})
+
+    @unittest.skipUnless(shutil.which('clang') and (shutil.which('lipo') or shutil.which('llvm-lipo')),
+                         'Clang and lipo/llvm-lipo are required for Mach-O checks')
+    def test_qt_architecture_check_with_real_macho_files(self):
+        # Compile SDK-independent objects; no macOS host or Qt download is needed.
+        lipo = shutil.which('lipo') or shutil.which('llvm-lipo')
+        command = step(CI['jobs']['build_macos'], 'Verify Qt architecture')['run']
+        with tempfile.TemporaryDirectory(prefix='dolphin-ci-macho-') as directory:
+            qt_prefix = Path(directory) / 'Qt prefix with spaces'
+            library = qt_prefix / 'lib/QtCore.framework/QtCore'
+            library.parent.mkdir(parents=True)
+            objects = {}
+            for arch in ('x86_64', 'arm64'):
+                objects[arch] = Path(directory) / (arch + '.o')
+                result = subprocess.run(
+                    ['clang', '-target', arch + '-apple-macos11', '-x', 'c', '-c',
+                     '-o', str(objects[arch]), '-'], input='int ci_architecture_probe;\n',
+                    text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([lipo, '-create', *(str(p) for p in objects.values()),
+                                     '-output', str(library)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for arch in objects:
+                with self.subTest(universal=True, arch=arch):
+                    result = self.run_bash('lipo() { "$CI_LIPO" "$@"; }\n' + command,
+                                           CI_LIPO=lipo, QT_ROOT_DIR=str(qt_prefix), MACOS_ARCH=arch)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for present, missing in (('x86_64', 'arm64'), ('arm64', 'x86_64')):
+                with self.subTest(universal=False, missing=missing):
+                    shutil.copyfile(objects[present], library)
+                    result = self.run_bash('lipo() { "$CI_LIPO" "$@"; }\n' + command,
+                                           CI_LIPO=lipo, QT_ROOT_DIR=str(qt_prefix), MACOS_ARCH=missing)
+                    self.assertNotEqual(result.returncode, 0)
 
     def test_runner_guard_rejects_rosetta_or_wrong_runner(self):
         command = step(CI['jobs']['build_macos'], 'Verify native runner')['run']
@@ -209,10 +245,12 @@ class MacOSCommandTests(unittest.TestCase):
             lipo() {
                 if [ "$1" = -archs ]; then
                     echo "$TEST_MAIN_ARCH"
-                elif [[ "$3" == *QtCore* ]]; then
-                    [[ " $TEST_LIBRARY_ARCHS " == *" $2 "* ]] || return 41
                 else
-                    test "$2" = "$MACOS_ARCH"
+                    test "$2" = -verify_arch
+                    test "$3" = "$MACOS_ARCH"
+                    if [[ "$1" == *QtCore* ]]; then
+                        [[ " $TEST_LIBRARY_ARCHS " == *" $3 "* ]] || return 41
+                    fi
                 fi
             }
             find() { printf '%s\\0' "$1/Contents/MacOS/DolphinQt" \
