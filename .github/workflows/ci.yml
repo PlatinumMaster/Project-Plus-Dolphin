@@ -174,7 +174,7 @@ jobs:
           cache-key-prefix: ${{ matrix.runner }}-qt-v1
 
       - name: Verify Qt architecture
-        run: lipo -verify_arch "$MACOS_ARCH" "$QT_ROOT_DIR/lib/QtCore.framework/QtCore"
+        run: lipo "$QT_ROOT_DIR/lib/QtCore.framework/QtCore" -verify_arch "$MACOS_ARCH"
 
       # Runner labels separate native architectures while preserving Intel caches.
       - name: Cache MoltenVK
@@ -205,7 +205,7 @@ jobs:
           rm -rf mvk-build
 
       - name: Verify MoltenVK architecture
-        run: lipo -verify_arch "$MACOS_ARCH" "$HOME/moltenvk/lib/libMoltenVK.dylib"
+        run: lipo "$HOME/moltenvk/lib/libMoltenVK.dylib" -verify_arch "$MACOS_ARCH"
 
       # Save as soon as the dependency succeeds, even if Dolphin later fails.
       - name: Save MoltenVK
@@ -291,7 +291,7 @@ jobs:
           test "$(lipo -archs "$app/Contents/MacOS/DolphinQt")" = "$MACOS_ARCH"
           while IFS= read -r -d '' binary; do
             case "$(file -b "$binary")" in
-              *Mach-O*) lipo -verify_arch "$MACOS_ARCH" "$binary" ;;
+              *Mach-O*) lipo "$binary" -verify_arch "$MACOS_ARCH" ;;
             esac
           done < <(find "$app" -type f -print0)
           codesign --verify --deep --strict --verbose=2 "$app"

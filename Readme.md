@@ -151,6 +151,8 @@ created on an unrelated feature branch is not shared with every other branch.
 Local workflow checks: `actionlint .github/workflows/ci.yml .github/workflows/dependencies.yml`
 and `python3 .github/workflows/scripts/test_ci.py` (requires PyYAML; install `pwsh`
 to also check Windows script syntax, argument quoting, and failure propagation).
+With Clang and `lipo` or `llvm-lipo` installed, the tests also compile small
+Mach-O fixtures and execute the Qt architecture check with the real tool.
 These checks do not replace Windows/macOS hosted builds and artifact smoke tests.
 
 Flatpak downloads the prebuilt SDK selected by its manifest and reuses its own
