@@ -7,6 +7,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import unittest
@@ -106,6 +107,51 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(CI['jobs'][name]['env']['CCACHE_MAXSIZE'], '2G')
             self.assertEqual(step(CI['jobs'][name], 'Install cached Qt binaries')['with']['cache'], 'true')
 
+    def test_macos_has_native_intel_and_apple_silicon_jobs(self):
+        mac = CI['jobs']['build_macos']
+        self.assertEqual(mac['strategy']['fail-fast'], 'false')
+        self.assertEqual(mac['runs-on'], '${{ matrix.runner }}')
+        self.assertEqual(mac['env']['MACOS_ARCH'], '${{ matrix.arch }}')
+        self.assertEqual(mac['strategy']['matrix']['include'], [
+            {'runner': 'macos-15-intel', 'arch': 'x86_64'},
+            {'runner': 'macos-15', 'arch': 'arm64'},
+        ])
+        warmer = DEPENDENCIES['jobs']['dependencies']['strategy']['matrix']['runner']
+        for entry in mac['strategy']['matrix']['include']:
+            self.assertIn(entry['runner'], warmer)
+        self.assertIn('$MACOS_ARCH', step(mac, 'Prepare Build Artifacts')['run'])
+
+    def test_macos_caches_are_separate_and_preserve_intel_keys(self):
+        mac = CI['jobs']['build_macos']
+        for name, field in (('Install cached Qt binaries', 'cache-key-prefix'),
+                            ('Cache MoltenVK', 'key'), ('Restore compiled objects', 'key'),
+                            ('Restore compiled objects', 'restore-keys')):
+            with self.subTest(step=name, field=field):
+                key = step(mac, name)['with'][field]
+                self.assertTrue(key.startswith('${{ matrix.runner }}-'))
+                intel = key.replace('${{ matrix.runner }}', 'macos-15-intel')
+                arm = key.replace('${{ matrix.runner }}', 'macos-15')
+                self.assertNotEqual(intel, arm)
+                self.assertTrue(intel.startswith(('macos-15-intel-qt-v1',
+                                                 'macos-15-intel-moltenvk-v2-',
+                                                 'macos-15-intel-ccache-v2-')))
+
+    def test_macos_signing_and_verification_precede_upload(self):
+        mac = CI['jobs']['build_macos']
+        configure = step(mac, 'Generate CMake Files')['run']
+        self.assertIn('-DMACOS_CODE_SIGNING=ON', configure)
+        self.assertIn('-DMACOS_CODE_SIGNING_IDENTITY=-', configure)
+        entitlements = plistlib.loads(
+            (ROOT / 'Source/Core/DolphinQt/DolphinEmu.entitlements').read_bytes())
+        self.assertTrue(entitlements['com.apple.security.cs.allow-jit'])
+        names = [s['name'] for s in mac['steps']]
+        self.assertLess(names.index('Verify Qt architecture'), names.index('Generate CMake Files'))
+        self.assertLess(names.index('Verify MoltenVK architecture'), names.index('Save MoltenVK'))
+        self.assertLess(names.index('Verify macOS bundle'), names.index('Prepare Build Artifacts'))
+        self.assertLess(names.index('Prepare Build Artifacts'), names.index('Upload Artifact'))
+        for name in ('Verify Qt architecture', 'Verify MoltenVK architecture'):
+            self.assertIn('lipo -verify_arch "$MACOS_ARCH"', step(mac, name)['run'])
+
     def test_bash_step_syntax(self):
         jobs = [CI['jobs']['build_macos'], CI['jobs']['build_appimage'], BUNDLE['runs']]
         for job in jobs:
@@ -115,6 +161,83 @@ class WorkflowTests(unittest.TestCase):
                         result = subprocess.run(['bash', '-n'], input=item['run'], text=True,
                                                 capture_output=True)
                         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class MacOSCommandTests(unittest.TestCase):
+    def run_bash(self, script, **extra_env):
+        return subprocess.run(['bash', '-euo', 'pipefail', '-c', script], text=True,
+                              capture_output=True, env={**os.environ, **extra_env})
+
+    def test_runner_guard_rejects_rosetta_or_wrong_runner(self):
+        command = step(CI['jobs']['build_macos'], 'Verify native runner')['run']
+        for expected in ('arm64', 'x86_64'):
+            for actual in ('arm64', 'x86_64'):
+                with self.subTest(expected=expected, actual=actual):
+                    result = self.run_bash('uname() { echo "$TEST_HOST_ARCH"; }\n' + command,
+                                           MACOS_ARCH=expected, TEST_HOST_ARCH=actual)
+                    self.assertEqual(result.returncode, int(expected != actual), result.stderr)
+
+    def test_application_and_dependencies_use_matching_native_architectures(self):
+        commands = [step(CI['jobs']['build_macos'], 'Generate CMake Files')['run'],
+                    step(BUNDLE['runs'], 'Configure dependency bundle and record toolchain')['run'],
+                    step(BUNDLE['runs'], 'Verify installed dependency libraries')['run']]
+        mocks = '''
+            uname() { echo "$MACOS_ARCH"; }
+            cmake() { printf '%s\\n' "$@"; }
+            ctest() { :; }
+        '''
+        for arch in ('arm64', 'x86_64'):
+            for index, command in enumerate(commands):
+                with self.subTest(arch=arch, command=index):
+                    result = self.run_bash(mocks + command, MACOS_ARCH=arch, RUNNER_OS='macOS',
+                                           QT_ROOT_DIR='/qt prefix', DEPENDENCY_PREFIX='/deps prefix',
+                                           GITHUB_WORKSPACE='/ci workspace', GITHUB_OUTPUT=os.devnull)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = result.stdout.splitlines()
+                    self.assertIn('-DCMAKE_OSX_ARCHITECTURES=' + arch, args)
+                    self.assertIn('-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0', args)
+                    self.assertIn('-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON', args)
+                    if index == 0:
+                        self.assertIn('-DDOLPHIN_DEPENDENCY_PREFIX=/deps prefix', args)
+                    if index == 2:
+                        self.assertIn('-DDOLPHIN_DEPENDENCY_PREFIX=/ci workspace/build-dependency-prefix',
+                                      args)
+
+    def test_bundle_checks_reject_wrong_architecture_signature_or_startup(self):
+        command = step(CI['jobs']['build_macos'], 'Verify macOS bundle')['run']
+        mocks = '''
+            lipo() {
+                if [ "$1" = -archs ]; then
+                    echo "$TEST_MAIN_ARCH"
+                elif [[ "$3" == *QtCore* ]]; then
+                    [[ " $TEST_LIBRARY_ARCHS " == *" $2 "* ]] || return 41
+                else
+                    test "$2" = "$MACOS_ARCH"
+                fi
+            }
+            find() { printf '%s\\0' "$1/Contents/MacOS/DolphinQt" \
+                "$1/Contents/Frameworks/QtCore.framework/QtCore" "$1/Contents/Resources/icon.png"; }
+            file() { if [[ "$2" == *.png ]]; then echo PNG; else echo Mach-O; fi; }
+            codesign() { echo SIGNATURE; return "$TEST_SIGN_EXIT"; }
+            function build/Binaries/DolphinQt.app/Contents/MacOS/DolphinQt() {
+                test "$1" = --version
+                echo STARTUP
+                return "$TEST_STARTUP_EXIT"
+            }
+        '''
+        for arch in ('arm64', 'x86_64'):
+            wrong = 'x86_64' if arch == 'arm64' else 'arm64'
+            cases = ((arch, 'arm64 x86_64', 0, 0, 0), (wrong, arch, 0, 0, 1),
+                     (arch, wrong, 0, 0, 41), (arch, arch, 42, 0, 42),
+                     (arch, arch, 0, 43, 43))
+            for main, libraries, sign, startup, expected in cases:
+                with self.subTest(arch=arch, main=main, libraries=libraries, exit=expected):
+                    result = self.run_bash(mocks + command, MACOS_ARCH=arch, TEST_MAIN_ARCH=main,
+                                           TEST_LIBRARY_ARCHS=libraries, TEST_SIGN_EXIT=str(sign),
+                                           TEST_STARTUP_EXIT=str(startup))
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected in (1, 41, 42):
+                        self.assertNotIn('STARTUP', result.stdout)
 
 
 @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell is not installed')

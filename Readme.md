@@ -110,6 +110,21 @@ failure does not discard them. GitHub cache eviction or a toolchain/dependency
 change can still require rebuilding. The manually dispatched **Prepare Native
 Dependencies** workflow can populate the caches for all three platforms.
 
+macOS produces two separate native builds: `x86_64` on `macos-15-intel` and
+`arm64` on `macos-15` for Apple Silicon (M-series). Both use standard
+[GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+The dependency workflow covers both runners, and their library, Qt, MoltenVK,
+and compiler caches are separate. The Intel Qt/MoltenVK/compiler cache keys are
+unchanged. Download the artifact containing `macOS-arm64` for an M-series Mac
+or `macOS-x86_64` for an Intel Mac; these are not universal app bundles.
+
+Both macOS jobs verify the architecture of Qt, MoltenVK, and every bundled
+Mach-O binary before uploading. The app is ad-hoc signed using Dolphin's existing
+JIT entitlements, then its signature and `--version` startup are checked on the
+native runner. No Apple signing certificate is required, but these builds are
+not notarized. These checks do not test gameplay or cross-architecture rollback
+determinism; those still require runtime testing.
+
 Qt is prebuilt on all three platforms: Windows uses its pinned Qt submodule,
 while macOS and Linux download and cache Qt binaries. macOS also caches the
 Dolphin-patched MoltenVK library separately. Other bundled dependencies continue
