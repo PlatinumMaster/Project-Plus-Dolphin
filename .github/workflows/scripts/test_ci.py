@@ -277,6 +277,50 @@ class MacOSCommandTests(unittest.TestCase):
                     if expected in (1, 41, 42):
                         self.assertNotIn('STARTUP', result.stdout)
 
+    def test_bundle_startup_does_not_inherit_sdk_plugin_paths(self):
+        command = step(CI['jobs']['build_macos'], 'Verify macOS bundle')['run']
+        plugin_paths = ('QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH',
+                        'QML2_IMPORT_PATH', 'QML_IMPORT_PATH')
+        mocks = '''
+            lipo() { if [ "$1" = -archs ]; then echo "$MACOS_ARCH"; fi; }
+            find() { :; }
+            codesign() { :; }
+            function build/Binaries/DolphinQt.app/Contents/MacOS/DolphinQt() {
+                test "$1" = --version
+                for qt_variable in QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH \
+                                   QML2_IMPORT_PATH QML_IMPORT_PATH; do
+                    if printenv "$qt_variable" >/dev/null; then
+                        echo "$qt_variable leaked into the packaged app" >&2
+                        return 44
+                    fi
+                done
+                # The startup test still uses the normal environment otherwise.
+                test "$QT_ROOT_DIR" = '/Qt SDK/macos'
+                command -v bash >/dev/null
+                echo STARTUP
+            }
+        '''
+        for arch in ('arm64', 'x86_64'):
+            for value in (None, '', '/Qt SDK/macos/plugins:/another SDK/plugins'):
+                with self.subTest(arch=arch, plugin_path=value):
+                    # Remove any paths from this test process before simulating CI.
+                    setup = 'unset ' + ' '.join(plugin_paths) + '\n'
+                    if value is not None:
+                        setup += ''.join(f'export {name}="$TEST_SDK_PATH"\n'
+                                         for name in plugin_paths)
+                    # Clearing paths must be scoped to the app, not later steps.
+                    parent_check = ''
+                    for name in plugin_paths:
+                        if value is None:
+                            parent_check += f'test -z "${{{name}+set}}"\n'
+                        else:
+                            parent_check += f'test "${{{name}}}" = "$TEST_SDK_PATH"\n'
+                    result = self.run_bash(setup + mocks + command + '\n' + parent_check,
+                                           MACOS_ARCH=arch, QT_ROOT_DIR='/Qt SDK/macos',
+                                           TEST_SDK_PATH=value or '')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('STARTUP', result.stdout)
+
 
 @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell is not installed')
 class WindowsCommandTests(unittest.TestCase):

@@ -295,7 +295,12 @@ jobs:
             esac
           done < <(find "$app" -type f -print0)
           codesign --verify --deep --strict --verbose=2 "$app"
-          "$app/Contents/MacOS/DolphinQt" --version
+          (
+            # Test the bundled plugins, not the SDK paths exported by install-qt-action.
+            # Mixing SDK plugins with bundled frameworks loads Qt twice and aborts.
+            unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH
+            "$app/Contents/MacOS/DolphinQt" --version
+          )
 
       - name: Prepare Build Artifacts
         id: create-artifact
