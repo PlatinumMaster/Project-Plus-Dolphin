@@ -11,12 +11,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -184,6 +186,16 @@ struct SampledLocalInput
 {
   s64 frame = 0;
   WirePad input{};
+  u64 sample_time_ns = 0;
+};
+
+struct InputLatencyFrame
+{
+  int frame = -1;
+  u64 sample_time_ns = 0;
+  u64 selected_time_ns = 0;
+  u64 si_relatched_time_ns = 0;
+  u64 guest_resume_time_ns = 0;
 };
 
 std::deque<SimulatedPacket> s_packets_to_main;
@@ -415,6 +427,7 @@ struct HostMemoryWriteEvent
 struct GekkoManager
 {
   std::recursive_mutex mutex;
+  std::mutex input_latency_mutex;
   GekkoSession* session = nullptr;
   GekkoSession* simulated_peer_session = nullptr;
   std::unique_ptr<SnapshotRing> ring;
@@ -446,12 +459,22 @@ struct GekkoManager
   std::atomic<bool> precise_vi_guard_requested{false};
   bool late_vi_guard = false;
   int configured_local_delay = 0;
+  int configured_prediction_window = 0;
   u32 session_id = 0;
   u64 local_input_frame = 0;
   std::vector<int> player_handles;
   std::vector<ENetAddress> remote_endpoints;
   std::deque<QueuedEvent> pending_events;
   std::deque<SampledLocalInput> sampled_local_inputs;
+  std::deque<InputLatencyFrame> pending_input_latency_frames;
+  std::array<double, 300> perf_input_poll_to_select_ms{};
+  std::array<double, 300> perf_input_select_to_si_ms{};
+  std::array<double, 300> perf_input_si_to_resume_ms{};
+  std::array<double, 300> perf_input_resume_to_present_ms{};
+  std::array<double, 300> perf_input_poll_to_present_ms{};
+  std::size_t perf_input_latency_count = 0;
+  u64 perf_input_latency_dropped = 0;
+  u64 perf_input_latency_unmatched_presents = 0;
   std::array<GCPadStatus, MAX_PORTS> latched_pads{};
   std::atomic<bool> active{false};
   std::atomic<bool> stop_requested{false};
@@ -490,6 +513,8 @@ struct GekkoManager
   double speed_scale = 1.0;
   double target_scale = 1.0;
   int timesync_counter = 0;
+  bool visible_frame_pacing_pending = false;
+  bool deferred_visible_follows_rollback = false;
   std::optional<std::pair<s64, TimePoint>> throttle_reference_before_load;
   Common::PrecisionTimer wait_timer;
 
@@ -1775,12 +1800,15 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
   g_manager.stop_ram_compare_on_mismatch =
       options.stop_ram_compare_on_mismatch && g_manager.compare_confirmed_ram;
   SetDetailedResimProfilingEnabled(options.deep_logging);
+  DirtyPages::SetCommitProfilingEnabled(options.deep_logging);
+  DirtyPages::SetParallelCompareEnabled(options.parallel_dirty_compare);
   SetCoarseFifoTiming(options.coarse_fifo_timing);
   g_manager.late_vi_guard = options.late_vi_guard;
   g_manager.ram_diagnostic_dumped = false;
   g_manager.frame_boundary = options.frame_boundary;
   g_manager.vi_boundary_pending.store(false, std::memory_order_relaxed);
   g_manager.configured_local_delay = clamped_delay;
+  g_manager.configured_prediction_window = clamped_prediction;
   g_manager.session_id = session_id;
   g_manager.local_input_frame = 0;
   // GetRollbackPad is active throughout boot, before Gekko emits the first Advance event. Never
@@ -1793,6 +1821,13 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
   g_manager.remote_endpoints.clear();
   g_manager.pending_events.clear();
   g_manager.sampled_local_inputs.clear();
+  {
+    std::lock_guard latency_lk(g_manager.input_latency_mutex);
+    g_manager.pending_input_latency_frames.clear();
+    g_manager.perf_input_latency_count = 0;
+    g_manager.perf_input_latency_dropped = 0;
+    g_manager.perf_input_latency_unmatched_presents = 0;
+  }
   g_manager.ram_digests.clear();
   g_manager.remote_ram_digests.clear();
   g_manager.first_ram_mismatch_frame.reset();
@@ -1877,6 +1912,8 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
   g_manager.perf_real_gaps_over_25_ms = 0;
   g_manager.perf_real_gaps_over_33_ms = 0;
   g_manager.perf_real_gaps_over_50_ms = 0;
+  g_manager.visible_frame_pacing_pending = false;
+  g_manager.deferred_visible_follows_rollback = false;
   g_manager.throttle_reference_before_load.reset();
 
   for (int p = 1; p <= players; ++p)
@@ -1918,12 +1955,11 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
         destroy_failed_session();
         return false;
       }
-      NOTICE_LOG_FMT(CORE, "GekkoNet: Native player {} endpoint {}", p, player_endpoints[p]);
+      NOTICE_LOG_FMT(CORE, "GekkoNet: Native endpoint configured for player {}", p);
       ENetAddress endpoint{};
       if (!ParsePeerEndpoint(player_endpoints[p], &endpoint))
       {
-        ERROR_LOG_FMT(CORE, "GekkoNet: Invalid native endpoint for player {}: {}", p,
-                      player_endpoints[p]);
+        ERROR_LOG_FMT(CORE, "GekkoNet: Invalid native endpoint for player {}", p);
         destroy_failed_session();
         return false;
       }
@@ -2004,7 +2040,8 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
       "stress_input_period_frames={}, "
       "stress_rollback_frames={}, "
       "tracked_bitmap_clear={}, "
-      "full_scan_benchmark={}, full_scan_keep_tracking={}, compare_confirmed_ram={}, "
+      "full_scan_benchmark={}, full_scan_keep_tracking={}, parallel_dirty_compare={}, "
+      "compare_confirmed_ram={}, "
       "frame_boundary={})",
       game_name, players, local_player, session_id, clamped_delay, clamped_rollback_window,
       clamped_prediction, g_manager.local_uses_gc_adapter ? "gc_adapter" : "emulated_pad",
@@ -2014,7 +2051,8 @@ static bool StartGekkoSessionImpl(const std::string& game_name, u32 session_id, 
       options.disable_project_plus_music,
       options.native_stress ? std::max(1u, options.stress_interval) : STRESS_INPUT_PERIOD_FRAMES,
       clamped_rollback_window, g_manager.tracked_bitmap_clear, g_manager.full_scan_benchmark,
-      g_manager.full_scan_keep_tracking, g_manager.compare_confirmed_ram,
+      g_manager.full_scan_keep_tracking, options.parallel_dirty_compare,
+      g_manager.compare_confirmed_ram,
       FrameBoundaryName(g_manager.frame_boundary));
   NOTICE_LOG_FMT(CORE, "GekkoNet optimization settings: coarse_fifo_timing={}, late_vi_guard={}",
                  UseCoarseFifoTiming(), g_manager.late_vi_guard);
@@ -2080,12 +2118,16 @@ void StopGekkoSession()
   }
   ResetSimulatedLink();
   g_manager.pending_events.clear();
+  g_manager.visible_frame_pacing_pending = false;
+  g_manager.deferred_visible_follows_rollback = false;
   g_manager.throttle_reference_before_load.reset();
   if (g_manager.ring)
     g_manager.ring->Reset(Core::System::GetInstance());
   g_manager.ring.reset();
   Rollback::SetResimulating(false);
   Rollback::SetDetailedResimProfilingEnabled(false);
+  DirtyPages::SetCommitProfilingEnabled(false);
+  DirtyPages::SetParallelCompareEnabled(false);
   Rollback::SetCoarseFifoTiming(false);
   if (had_session)
     NOTICE_LOG_FMT(CORE, "GekkoNet: Session stopped");
@@ -2156,6 +2198,9 @@ static bool SubmitLocalInput()
   {
     local_status = Pad::GetStatus(LOCAL_PAD);
   }
+  const u64 sample_time_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  Clock::now().time_since_epoch())
+                                                  .count());
   const bool input_spam_active = g_manager.local_input_frame >= P2_INPUT_SPAM_START_FRAME;
   // Debug input belongs to this Dolphin process. Modify its sampled local pad before the input is
   // serialized for GekkoNet; the local actor then carries it to whichever seat matchmaking gave
@@ -2202,7 +2247,8 @@ static bool SubmitLocalInput()
   // Keep the raw host sample beside the Gekko frame on which it was submitted. When Gekko later
   // emits the local player's input for an Advance event, this lets diagnostics verify the actual
   // delay behavior instead of merely reporting the configured value.
-  g_manager.sampled_local_inputs.push_back({static_cast<s64>(g_manager.local_input_frame), wire});
+  g_manager.sampled_local_inputs.push_back(
+      {static_cast<s64>(g_manager.local_input_frame), wire, sample_time_ns});
 
   gekko_add_local_input(g_manager.session, g_manager.local_handle, &wire);
 
@@ -2329,17 +2375,20 @@ static bool InputsEqual(const WirePad& lhs, const WirePad& rhs)
   return std::memcmp(&lhs, &rhs, sizeof(WirePad)) == 0;
 }
 
-static void MeasureLocalInputDelay(int advance_frame, const std::vector<unsigned char>& inputs)
+static std::optional<u64> MeasureLocalInputDelay(int advance_frame,
+                                                 const std::vector<unsigned char>& inputs)
 {
   if (g_manager.local_handle < 0)
-    return;
+    return std::nullopt;
+
+  std::optional<u64> applied_sample_time_ns;
 
   const std::size_t input_offset =
       static_cast<std::size_t>(g_manager.local_handle) * sizeof(WirePad);
   if (inputs.size() < input_offset + sizeof(WirePad))
   {
     ++g_manager.perf_delay_missing;
-    return;
+    return std::nullopt;
   }
 
   WirePad applied{};
@@ -2360,6 +2409,7 @@ static void MeasureLocalInputDelay(int advance_frame, const std::vector<unsigned
     }
     else
     {
+      applied_sample_time_ns = expected->sample_time_ns;
       ++g_manager.perf_delay_checks;
       if (InputsEqual(applied, expected->input))
         ++g_manager.perf_delay_matches;
@@ -2407,6 +2457,113 @@ static void MeasureLocalInputDelay(int advance_frame, const std::vector<unsigned
   {
     g_manager.sampled_local_inputs.pop_front();
   }
+  return applied_sample_time_ns;
+}
+
+static u64 SteadyNowNs()
+{
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              Clock::now().time_since_epoch())
+                              .count());
+}
+
+static void RecordGekkoInputGuestResume()
+{
+  if (!IsDetailedResimProfilingEnabled())
+    return;
+
+  std::lock_guard lk(g_manager.input_latency_mutex);
+  if (!g_manager.pending_input_latency_frames.empty())
+  {
+    InputLatencyFrame& frame = g_manager.pending_input_latency_frames.back();
+    if (frame.guest_resume_time_ns == 0)
+      frame.guest_resume_time_ns = SteadyNowNs();
+  }
+}
+
+void RecordGekkoInputPresentation(u64 present_time_ns)
+{
+  if (!IsDetailedResimProfilingEnabled() ||
+      !g_manager.active.load(std::memory_order_relaxed))
+  {
+    return;
+  }
+
+  std::lock_guard lk(g_manager.input_latency_mutex);
+  if (g_manager.pending_input_latency_frames.empty())
+  {
+    ++g_manager.perf_input_latency_unmatched_presents;
+    return;
+  }
+
+  // Presentation is not guaranteed to run once for every emulated frame. Startup, frame skips,
+  // and rollback catch-up can all advance several logical frames without presenting them. Pair
+  // this presentation with the newest frame that actually returned to guest execution, and
+  // discard older superseded samples instead of allowing a permanent FIFO offset to accumulate.
+  const auto newest_ready = std::find_if(
+      g_manager.pending_input_latency_frames.rbegin(),
+      g_manager.pending_input_latency_frames.rend(),
+      [](const InputLatencyFrame& frame) { return frame.guest_resume_time_ns != 0; });
+  if (newest_ready == g_manager.pending_input_latency_frames.rend())
+  {
+    ++g_manager.perf_input_latency_unmatched_presents;
+    return;
+  }
+
+  const auto ready = std::prev(newest_ready.base());
+  const InputLatencyFrame frame = *ready;
+  g_manager.perf_input_latency_dropped +=
+      static_cast<u64>(std::distance(g_manager.pending_input_latency_frames.begin(), ready));
+  g_manager.pending_input_latency_frames.erase(g_manager.pending_input_latency_frames.begin(),
+                                               std::next(ready));
+  if (frame.guest_resume_time_ns == 0 || present_time_ns < frame.guest_resume_time_ns ||
+      frame.guest_resume_time_ns < frame.si_relatched_time_ns ||
+      frame.si_relatched_time_ns < frame.selected_time_ns ||
+      frame.selected_time_ns < frame.sample_time_ns)
+  {
+    ++g_manager.perf_input_latency_dropped;
+    return;
+  }
+
+  constexpr double NS_TO_MS = 1.0 / 1'000'000.0;
+  const std::size_t index = g_manager.perf_input_latency_count++;
+  g_manager.perf_input_poll_to_select_ms[index] =
+      static_cast<double>(frame.selected_time_ns - frame.sample_time_ns) * NS_TO_MS;
+  g_manager.perf_input_select_to_si_ms[index] =
+      static_cast<double>(frame.si_relatched_time_ns - frame.selected_time_ns) * NS_TO_MS;
+  g_manager.perf_input_si_to_resume_ms[index] =
+      static_cast<double>(frame.guest_resume_time_ns - frame.si_relatched_time_ns) * NS_TO_MS;
+  g_manager.perf_input_resume_to_present_ms[index] =
+      static_cast<double>(present_time_ns - frame.guest_resume_time_ns) * NS_TO_MS;
+  g_manager.perf_input_poll_to_present_ms[index] =
+      static_cast<double>(present_time_ns - frame.sample_time_ns) * NS_TO_MS;
+
+  if (g_manager.perf_input_latency_count != g_manager.perf_input_poll_to_select_ms.size())
+    return;
+
+  const auto summarize = [](const std::array<double, 300>& values) {
+    std::array<double, 300> sorted = values;
+    std::ranges::sort(sorted);
+    return std::array<double, 3>{sorted[149], sorted[284], sorted.back()};
+  };
+  const auto poll_select = summarize(g_manager.perf_input_poll_to_select_ms);
+  const auto select_si = summarize(g_manager.perf_input_select_to_si_ms);
+  const auto si_resume = summarize(g_manager.perf_input_si_to_resume_ms);
+  const auto resume_present = summarize(g_manager.perf_input_resume_to_present_ms);
+  const auto poll_present = summarize(g_manager.perf_input_poll_to_present_ms);
+  NOTICE_LOG_FMT(
+      CORE,
+      "GekkoNet input age: p50/p95/max ms poll->select {:.3f}/{:.3f}/{:.3f}, "
+      "select->SI {:.3f}/{:.3f}/{:.3f}, SI->resume {:.3f}/{:.3f}/{:.3f}, "
+      "resume->present {:.3f}/{:.3f}/{:.3f}, poll->present {:.3f}/{:.3f}/{:.3f}; "
+      "dropped={}, unmatched_presents={}",
+      poll_select[0], poll_select[1], poll_select[2], select_si[0], select_si[1], select_si[2],
+      si_resume[0], si_resume[1], si_resume[2], resume_present[0], resume_present[1],
+      resume_present[2], poll_present[0], poll_present[1], poll_present[2],
+      g_manager.perf_input_latency_dropped, g_manager.perf_input_latency_unmatched_presents);
+  g_manager.perf_input_latency_count = 0;
+  g_manager.perf_input_latency_dropped = 0;
+  g_manager.perf_input_latency_unmatched_presents = 0;
 }
 
 static void QueueEvents(GekkoGameEvent** events, int event_count)
@@ -2454,8 +2611,13 @@ static double ElapsedMs(std::chrono::steady_clock::time_point start)
 
 static void AddSnapshotPhases(SnapshotPhaseTimings* total, const SnapshotPhaseTimings& sample)
 {
+  total->execution_barrier_ms += sample.execution_barrier_ms;
   total->state_ms += sample.state_ms;
   total->dirty_pages_ms += sample.dirty_pages_ms;
+  total->dirty_bitmap_scan_ms += sample.dirty_bitmap_scan_ms;
+  total->dirty_compare_ms += sample.dirty_compare_ms;
+  total->dirty_undo_log_ms += sample.dirty_undo_log_ms;
+  total->dirty_mirror_copy_ms += sample.dirty_mirror_copy_ms;
   total->l1_ms += sample.l1_ms;
   total->jit_ms += sample.jit_ms;
   total->journal_ms += sample.journal_ms;
@@ -2463,6 +2625,8 @@ static void AddSnapshotPhases(SnapshotPhaseTimings* total, const SnapshotPhaseTi
   total->changed_blocks += sample.changed_blocks;
   total->changed_cache_lines += sample.changed_cache_lines;
   total->jit_blocks_invalidated += sample.jit_blocks_invalidated;
+  total->dirty_marked_pages += sample.dirty_marked_pages;
+  total->dirty_changed_pages += sample.dirty_changed_pages;
 }
 
 // Native GekkoNet uses frame -1 for the snapshot immediately before frame 0. SnapshotRing uses
@@ -2723,18 +2887,21 @@ static void MaybeLogPerformance(Core::System& system)
   }
 
   const double save_known_ms =
-      g_manager.perf_save_phases.state_ms + g_manager.perf_save_phases.dirty_pages_ms +
-      g_manager.perf_save_phases.l1_ms + g_manager.perf_save_phases.journal_ms;
+      g_manager.perf_save_phases.execution_barrier_ms + g_manager.perf_save_phases.state_ms +
+      g_manager.perf_save_phases.dirty_pages_ms + g_manager.perf_save_phases.l1_ms +
+      g_manager.perf_save_phases.journal_ms;
   const double load_known_ms =
+      g_manager.perf_load_phases.execution_barrier_ms +
       g_manager.perf_load_phases.dirty_pages_ms + g_manager.perf_load_phases.jit_ms +
       g_manager.perf_load_phases.l1_ms + g_manager.perf_load_phases.state_ms +
       g_manager.perf_load_phases.journal_ms;
   NOTICE_LOG_FMT(
       CORE,
-      "GekkoNet snapshot phases: save state {:.3f} dirty {:.3f} l1 {:.3f} journal {:.3f} "
-      "other {:.3f} ms, state {:.1f} KiB; load dirty {:.3f} jit {:.3f} l1 {:.3f} state "
-      "{:.3f} journal {:.3f} other {:.3f} ms, changed {:.1f} pages/{:.1f} cache lines, "
-      "invalidated {:.1f} JIT blocks",
+      "GekkoNet snapshot phases: save barrier {:.3f} state {:.3f} dirty {:.3f} l1 {:.3f} "
+      "journal {:.3f} other {:.3f} ms, state {:.1f} KiB; load barrier {:.3f} dirty {:.3f} "
+      "jit {:.3f} l1 {:.3f} state {:.3f} journal {:.3f} other {:.3f} ms, changed {:.1f} "
+      "pages/{:.1f} cache lines, invalidated {:.1f} JIT blocks",
+      average(g_manager.perf_save_phases.execution_barrier_ms, g_manager.perf_save_count),
       average(g_manager.perf_save_phases.state_ms, g_manager.perf_save_count),
       average(g_manager.perf_save_phases.dirty_pages_ms, g_manager.perf_save_count),
       average(g_manager.perf_save_phases.l1_ms, g_manager.perf_save_count),
@@ -2743,6 +2910,7 @@ static void MaybeLogPerformance(Core::System& system)
       average(static_cast<double>(g_manager.perf_save_phases.state_bytes),
               g_manager.perf_save_count) /
           1024.0,
+      average(g_manager.perf_load_phases.execution_barrier_ms, g_manager.perf_load_count),
       average(g_manager.perf_load_phases.dirty_pages_ms, g_manager.perf_load_count),
       average(g_manager.perf_load_phases.jit_ms, g_manager.perf_load_count),
       average(g_manager.perf_load_phases.l1_ms, g_manager.perf_load_count),
@@ -2755,6 +2923,22 @@ static void MaybeLogPerformance(Core::System& system)
               g_manager.perf_load_count),
       average(static_cast<double>(g_manager.perf_load_phases.jit_blocks_invalidated),
               g_manager.perf_load_count));
+
+  if (g_manager.perf_save_phases.dirty_marked_pages != 0)
+  {
+    NOTICE_LOG_FMT(
+        CORE,
+        "GekkoNet dirty commit profile: bitmap/loop {:.3f} compare {:.3f} undo-log {:.3f} "
+        "mirror-copy {:.3f} ms/save, marked {:.1f} changed {:.1f} pages/save",
+        average(g_manager.perf_save_phases.dirty_bitmap_scan_ms, g_manager.perf_save_count),
+        average(g_manager.perf_save_phases.dirty_compare_ms, g_manager.perf_save_count),
+        average(g_manager.perf_save_phases.dirty_undo_log_ms, g_manager.perf_save_count),
+        average(g_manager.perf_save_phases.dirty_mirror_copy_ms, g_manager.perf_save_count),
+        average(static_cast<double>(g_manager.perf_save_phases.dirty_marked_pages),
+                g_manager.perf_save_count),
+        average(static_cast<double>(g_manager.perf_save_phases.dirty_changed_pages),
+                g_manager.perf_save_count));
+  }
 
   if (g_manager.compare_confirmed_ram)
   {
@@ -2822,14 +3006,82 @@ static void MaybeLogPerformance(Core::System& system)
   g_manager.perf_restore_mismatches = 0;
 }
 
+static void FinishRollbackBurst(Core::System& system,
+                                std::chrono::steady_clock::time_point now)
+{
+  Rollback::SetResimulating(false);
+  if (g_manager.throttle_reference_before_load)
+  {
+    system.GetCoreTiming().SetThrottleReference(*g_manager.throttle_reference_before_load);
+    g_manager.throttle_reference_before_load.reset();
+  }
+
+  if (!g_manager.rollback_burst_start)
+    return;
+
+  const auto burst_duration = now - *g_manager.rollback_burst_start;
+  const double elapsed = std::chrono::duration<double, std::milli>(burst_duration).count();
+  ++g_manager.perf_rollback_burst_count;
+  g_manager.perf_rollback_burst_ms += elapsed;
+  g_manager.perf_rollback_burst_max_ms =
+      std::max(g_manager.perf_rollback_burst_max_ms, elapsed);
+  const double other_ms =
+      std::max(0.0, elapsed - g_manager.current_burst_load_ms -
+                        g_manager.current_burst_exec_ms - g_manager.current_burst_save_ms);
+  const auto milliseconds_to_nanoseconds = [](double milliseconds) {
+    return static_cast<u64>(std::max(0.0, milliseconds) * 1'000'000.0);
+  };
+  Rollback::RecordRollbackBurst(
+      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(burst_duration).count()),
+      milliseconds_to_nanoseconds(g_manager.current_burst_load_ms),
+      milliseconds_to_nanoseconds(g_manager.current_burst_exec_ms),
+      milliseconds_to_nanoseconds(g_manager.current_burst_save_ms),
+      milliseconds_to_nanoseconds(other_ms), g_manager.current_rollback_replays);
+  g_manager.perf_burst_load_ms += g_manager.current_burst_load_ms;
+  g_manager.perf_burst_load_max_ms =
+      std::max(g_manager.perf_burst_load_max_ms, g_manager.current_burst_load_ms);
+  g_manager.perf_burst_exec_ms += g_manager.current_burst_exec_ms;
+  g_manager.perf_burst_exec_max_ms =
+      std::max(g_manager.perf_burst_exec_max_ms, g_manager.current_burst_exec_ms);
+  g_manager.perf_burst_save_ms += g_manager.current_burst_save_ms;
+  g_manager.perf_burst_save_max_ms =
+      std::max(g_manager.perf_burst_save_max_ms, g_manager.current_burst_save_ms);
+  g_manager.perf_burst_other_ms += other_ms;
+  g_manager.perf_burst_other_max_ms = std::max(g_manager.perf_burst_other_max_ms, other_ms);
+  g_manager.perf_rollback_depth_total += g_manager.current_rollback_replays;
+  g_manager.perf_rollback_depth_max =
+      std::max(g_manager.perf_rollback_depth_max, g_manager.current_rollback_replays);
+  g_manager.current_rollback_replays = 0;
+  g_manager.rollback_burst_start.reset();
+}
+
 // Consumes state operations up to one advance. Returning true means that the caller must return
 // to the CPU so the selected frame can actually run. GekkoNet can emit a complete rollback as one
 // batch (load, several replay advances/saves, then a real advance); Dolphin must spread that batch
 // across real frame boundaries instead of merely relatching all of its inputs in one callback.
-static bool PrepareQueuedFrame(Core::System& system)
+enum class PrepareFrameResult
+{
+  NoFrame,
+  FrameReady,
+  VisibleFrameDeferred,
+};
+
+static PrepareFrameResult PrepareQueuedFrame(Core::System& system,
+                                             bool allow_visible_advance = true)
 {
   while (!g_manager.pending_events.empty())
   {
+    const QueuedEvent& next = g_manager.pending_events.front();
+    if (!allow_visible_advance && next.type == GekkoAdvanceEvent && !next.rolling_back &&
+        !next.running_ahead)
+    {
+      const bool follows_rollback = g_manager.rollback_burst_start.has_value();
+      if (follows_rollback)
+        FinishRollbackBurst(system, std::chrono::steady_clock::now());
+      g_manager.deferred_visible_follows_rollback |= follows_rollback;
+      return PrepareFrameResult::VisibleFrameDeferred;
+    }
+
     QueuedEvent event = std::move(g_manager.pending_events.front());
     g_manager.pending_events.pop_front();
     RecordDiagnosticEvent(system, event);
@@ -2885,7 +3137,7 @@ static bool PrepareQueuedFrame(Core::System& system)
         {
           ERROR_LOG_FMT(CORE, "GekkoNet: Failed to restore rollback frame {}", event.frame);
           g_manager.stop_requested.store(true, std::memory_order_relaxed);
-          return false;
+          return PrepareFrameResult::NoFrame;
         }
         VerifyRestoredRam(system, event.frame);
         if (g_manager.stress_test && event.frame < 10)
@@ -2911,6 +3163,9 @@ static bool PrepareQueuedFrame(Core::System& system)
     case GekkoAdvanceEvent:
     {
       const bool resimulating = event.rolling_back || event.running_ahead;
+      const u64 selected_time_ns =
+          !resimulating && IsDetailedResimProfilingEnabled() ? SteadyNowNs() : 0;
+      std::optional<u64> applied_sample_time_ns;
       std::string start_players;
       std::pair<u32, u32> si0_before{};
       std::pair<u32, u32> si1_before{};
@@ -2935,45 +3190,21 @@ static bool PrepareQueuedFrame(Core::System& system)
       }
       g_manager.last_advance_has_start = !start_players.empty();
       if (!resimulating)
-        MeasureLocalInputDelay(event.frame, event.inputs);
+        applied_sample_time_ns = MeasureLocalInputDelay(event.frame, event.inputs);
       LatchInputs(event.inputs.data());
       RecordNetplayReplayFrame(system, event.frame);
-      Rollback::SetResimulating(resimulating);
-      if (!resimulating && g_manager.throttle_reference_before_load)
-      {
-        system.GetCoreTiming().SetThrottleReference(*g_manager.throttle_reference_before_load);
-        g_manager.throttle_reference_before_load.reset();
-      }
       const auto advance_now = std::chrono::steady_clock::now();
-      if (!resimulating && g_manager.rollback_burst_start)
+      if (resimulating)
       {
-        const auto burst_duration = advance_now - *g_manager.rollback_burst_start;
-        const double elapsed = std::chrono::duration<double, std::milli>(burst_duration).count();
-        Rollback::RecordRollbackBurst(static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(burst_duration).count()));
-        ++g_manager.perf_rollback_burst_count;
-        g_manager.perf_rollback_burst_ms += elapsed;
-        g_manager.perf_rollback_burst_max_ms =
-            std::max(g_manager.perf_rollback_burst_max_ms, elapsed);
-        const double other_ms =
-            std::max(0.0, elapsed - g_manager.current_burst_load_ms -
-                              g_manager.current_burst_exec_ms - g_manager.current_burst_save_ms);
-        g_manager.perf_burst_load_ms += g_manager.current_burst_load_ms;
-        g_manager.perf_burst_load_max_ms =
-            std::max(g_manager.perf_burst_load_max_ms, g_manager.current_burst_load_ms);
-        g_manager.perf_burst_exec_ms += g_manager.current_burst_exec_ms;
-        g_manager.perf_burst_exec_max_ms =
-            std::max(g_manager.perf_burst_exec_max_ms, g_manager.current_burst_exec_ms);
-        g_manager.perf_burst_save_ms += g_manager.current_burst_save_ms;
-        g_manager.perf_burst_save_max_ms =
-            std::max(g_manager.perf_burst_save_max_ms, g_manager.current_burst_save_ms);
-        g_manager.perf_burst_other_ms += other_ms;
-        g_manager.perf_burst_other_max_ms = std::max(g_manager.perf_burst_other_max_ms, other_ms);
-        g_manager.perf_rollback_depth_total += g_manager.current_rollback_replays;
-        g_manager.perf_rollback_depth_max =
-            std::max(g_manager.perf_rollback_depth_max, g_manager.current_rollback_replays);
-        g_manager.current_rollback_replays = 0;
-        g_manager.rollback_burst_start.reset();
+        Rollback::SetResimulating(true);
+      }
+      else
+      {
+        const bool follows_rollback = g_manager.deferred_visible_follows_rollback ||
+                                      g_manager.rollback_burst_start.has_value();
+        FinishRollbackBurst(system, advance_now);
+        Rollback::RecordFramePacingBoundary(event.frame, follows_rollback);
+        g_manager.deferred_visible_follows_rollback = false;
       }
       if (resimulating)
       {
@@ -3011,8 +3242,21 @@ static bool PrepareQueuedFrame(Core::System& system)
       }
       const auto frame_setup_start =
           resimulating ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      if (g_manager.frame_boundary == FrameBoundary::BrawlHook)
-        system.GetSerialInterface().RelatchInputs();
+      // Publish the inputs selected by GekkoNet before returning to guest execution. Waiting for
+      // the next scheduled SI poll adds an implicit input stage for VI-based boundaries.
+      system.GetSerialInterface().RelatchInputs();
+      if (applied_sample_time_ns && IsDetailedResimProfilingEnabled())
+      {
+        std::lock_guard latency_lk(g_manager.input_latency_mutex);
+        constexpr std::size_t MAX_PENDING_INPUT_LATENCY_FRAMES = 32;
+        if (g_manager.pending_input_latency_frames.size() >= MAX_PENDING_INPUT_LATENCY_FRAMES)
+        {
+          g_manager.pending_input_latency_frames.pop_front();
+          ++g_manager.perf_input_latency_dropped;
+        }
+        g_manager.pending_input_latency_frames.push_back(
+            {event.frame, *applied_sample_time_ns, selected_time_ns, SteadyNowNs(), 0});
+      }
       if (g_manager.compare_confirmed_ram)
       {
         NOTICE_LOG_FMT(CORE,
@@ -3057,14 +3301,36 @@ static bool PrepareQueuedFrame(Core::System& system)
                                               std::chrono::steady_clock::now() - frame_setup_start)
                                               .count()));
       }
-      return true;
+      return PrepareFrameResult::FrameReady;
     }
 
     default:
       break;
     }
   }
-  return false;
+  return PrepareFrameResult::NoFrame;
+}
+
+static bool StartPreparedFrame(Core::System& system)
+{
+  PrepareFrameResult result =
+      PrepareQueuedFrame(system, !g_manager.visible_frame_pacing_pending);
+  if (result == PrepareFrameResult::FrameReady)
+    return true;
+
+  if (result != PrepareFrameResult::VisibleFrameDeferred)
+    return false;
+
+  // All rollback advances and their saves have completed, and Gekko's next visible advance is
+  // waiting at the front of the queue. Pace against the original emulated deadline now, so the
+  // rollback burst consumes the idle budget instead of being added after a full frame wait.
+  auto& core_timing = system.GetCoreTiming();
+  core_timing.ThrottleForRollbackBoundary(static_cast<s64>(core_timing.GetTicks()));
+  g_manager.visible_frame_pacing_pending = false;
+
+  result = PrepareQueuedFrame(system);
+  ASSERT(result == PrepareFrameResult::FrameReady);
+  return result == PrepareFrameResult::FrameReady;
 }
 
 static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundary boundary)
@@ -3135,6 +3401,10 @@ static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundar
                        g_manager.current_burst_jit_blocks_invalidated);
       }
     }
+    else
+    {
+      g_manager.visible_frame_pacing_pending = true;
+    }
     g_manager.frame_execution_start.reset();
   }
 
@@ -3142,7 +3412,7 @@ static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundar
 
   // A rollback batch is replayed one emulated frame at a time. State saves left after the prior
   // advance are intentionally handled now, after that frame has completed.
-  if (PrepareQueuedFrame(system))
+  if (StartPreparedFrame(system))
     return;
 
   // Only publish confirmed hashes after the previous Gekko event batch has completely drained.
@@ -3201,13 +3471,167 @@ static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundar
 
   // Run GekkoNet event pump - must wait for an advance event each frame.
   const auto pump_start = std::chrono::steady_clock::now();
+  const bool diagnose_pump_stalls = IsDetailedResimProfilingEnabled();
+  const Common::ENet::RollbackDatagramStats pump_udp_start =
+      diagnose_pump_stalls ? Common::ENet::GetRollbackDatagramStats() :
+                             Common::ENet::RollbackDatagramStats{};
+  std::array<int, MAX_PORTS> received_at_pump_start{};
+  received_at_pump_start.fill(std::numeric_limits<int>::min());
+  if (diagnose_pump_stalls)
+  {
+    for (int p = 0; p < g_manager.players; ++p)
+    {
+      const int handle = g_manager.player_handles[p];
+      if (handle >= 0)
+        received_at_pump_start[p] = gekko_last_received_frame(g_manager.session, handle);
+    }
+  }
+
+  u64 pump_retries = 0;
+  double pump_update_ms = 0.0;
+  double pump_prepare_ms = 0.0;
+  double pump_sleep_ms = 0.0;
+  double pump_network_poll_ms = 0.0;
+  int last_event_count = 0;
+  int last_batch_saves = 0;
+  int last_batch_loads = 0;
+  int last_batch_advances = 0;
+  u64 total_saves = 0;
+  u64 total_loads = 0;
+  u64 total_advances = 0;
+  constexpr std::array<double, 4> PUMP_STALL_THRESHOLDS_MS{16.0, 33.0, 50.0, 100.0};
+  std::size_t next_pump_stall_threshold = 0;
+
+  const auto log_pump_stall = [&](std::string_view phase, double elapsed_ms) {
+    int pending_saves = 0;
+    int pending_loads = 0;
+    int pending_advances = 0;
+    int latest_pending_advance = -1;
+    for (const QueuedEvent& event : g_manager.pending_events)
+    {
+      switch (event.type)
+      {
+      case GekkoSaveEvent:
+        ++pending_saves;
+        break;
+      case GekkoLoadEvent:
+        ++pending_loads;
+        break;
+      case GekkoAdvanceEvent:
+        ++pending_advances;
+        latest_pending_advance = event.frame;
+        break;
+      default:
+        break;
+      }
+    }
+
+    const int current_frame = gekko_current_frame(g_manager.session);
+    int min_remote_received = std::numeric_limits<int>::max();
+    std::string player_frames;
+    for (int p = 0; p < g_manager.players; ++p)
+    {
+      const int handle = g_manager.player_handles[p];
+      if (handle < 0)
+        continue;
+      const int received = gekko_last_received_frame(g_manager.session, handle);
+      const bool local = handle == g_manager.local_handle;
+      player_frames +=
+          fmt::format("{}P{}:{}{}({:+d})", player_frames.empty() ? "" : ",", p + 1,
+                      local ? "L" : "R", received,
+                      received - received_at_pump_start[p]);
+      if (!local)
+        min_remote_received = std::min(min_remote_received, received);
+    }
+
+    const int predicted_remote_frames =
+        min_remote_received == std::numeric_limits<int>::max() ?
+            0 :
+            std::max(0, current_frame - min_remote_received - 1);
+    std::string_view reason = "input_unavailable";
+    if (pending_advances != 0)
+      reason = "advance_queued_but_deferred";
+    else if (min_remote_received != std::numeric_limits<int>::max() &&
+             predicted_remote_frames >= g_manager.configured_prediction_window)
+      reason = "remote_prediction_window_exhausted";
+    else if (last_event_count == 0)
+      reason = "no_game_events";
+    else
+      reason = "events_without_advance";
+
+    const Common::ENet::RollbackDatagramStats udp =
+        Common::ENet::GetRollbackDatagramStats();
+    GekkoNetworkStats network_stats{};
+    if (g_manager.remote_handle >= 0)
+      gekko_network_stats(g_manager.session, g_manager.remote_handle, &network_stats);
+
+    NOTICE_LOG_FMT(
+        CORE,
+        "GekkoNet pump stall: phase={} elapsed={:.3f} ms retries={} reason={}; "
+        "parts update={:.3f} prepare={:.3f} sleep={:.3f} network_poll={:.3f} ms; "
+        "frame current={} last_started={} latest_pending={} local_submitted={} ahead={:.2f}; "
+        "remote_prediction={}/{} frames; received=[{}]; "
+        "events last S/L/A={}/{}/{} total={}/{}/{} pending={}/{}/{}; "
+        "transport rx_delta={} reject_delta={} ping_last/avg/jitter={}/{:.1f}/{:.1f} ms",
+        phase, elapsed_ms, pump_retries, reason, pump_update_ms, pump_prepare_ms, pump_sleep_ms,
+        pump_network_poll_ms, current_frame, g_manager.frame_execution_gekko_frame,
+        latest_pending_advance, g_manager.local_input_frame, gekko_frames_ahead(g_manager.session),
+        predicted_remote_frames, g_manager.configured_prediction_window, player_frames,
+        last_batch_saves, last_batch_loads, last_batch_advances, total_saves, total_loads,
+        total_advances, pending_saves, pending_loads, pending_advances,
+        udp.received - pump_udp_start.received, udp.rejected - pump_udp_start.rejected,
+        network_stats.last_ping, network_stats.avg_ping, network_stats.jitter);
+  };
+
+  const auto maybe_log_waiting_pump = [&] {
+    if (!diagnose_pump_stalls)
+      return;
+    const double elapsed_ms = ElapsedMs(pump_start);
+    while (next_pump_stall_threshold < PUMP_STALL_THRESHOLDS_MS.size() &&
+           elapsed_ms >= PUMP_STALL_THRESHOLDS_MS[next_pump_stall_threshold])
+    {
+      log_pump_stall("waiting", elapsed_ms);
+      ++next_pump_stall_threshold;
+    }
+  };
+
   for (;;)
   {
     if (g_manager.stop_requested.load(std::memory_order_relaxed))
       return;
 
     int event_count = 0;
+    const auto update_start = std::chrono::steady_clock::now();
     GekkoGameEvent** events = gekko_update_session(g_manager.session, &event_count);
+    if (diagnose_pump_stalls)
+      pump_update_ms += ElapsedMs(update_start);
+
+    last_event_count = event_count;
+    last_batch_saves = 0;
+    last_batch_loads = 0;
+    last_batch_advances = 0;
+    for (int i = 0; i < event_count; ++i)
+    {
+      if (!events[i])
+        continue;
+      switch (events[i]->type)
+      {
+      case GekkoSaveEvent:
+        ++last_batch_saves;
+        ++total_saves;
+        break;
+      case GekkoLoadEvent:
+        ++last_batch_loads;
+        ++total_loads;
+        break;
+      case GekkoAdvanceEvent:
+        ++last_batch_advances;
+        ++total_advances;
+        break;
+      default:
+        break;
+      }
+    }
 
     // Check session lifecycle events
     int s_count = 0;
@@ -3244,9 +3668,16 @@ static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundar
     }
 
     QueueEvents(events, event_count);
-    if (PrepareQueuedFrame(system))
+    const auto prepare_start = std::chrono::steady_clock::now();
+    const bool frame_started = StartPreparedFrame(system);
+    if (diagnose_pump_stalls)
+      pump_prepare_ms += ElapsedMs(prepare_start);
+    if (frame_started)
     {
+      const double elapsed_ms = ElapsedMs(pump_start);
       RecordPumpTime(pump_start);
+      if (diagnose_pump_stalls && elapsed_ms >= PUMP_STALL_THRESHOLDS_MS.front())
+        log_pump_stall("resolved", elapsed_ms);
       return;
     }
 
@@ -3254,10 +3685,20 @@ static void ProcessFrameBoundary(const Core::CPUThreadGuard& guard, FrameBoundar
     // A sub-millisecond std::this_thread::sleep_for can consume a full scheduler quantum on
     // Windows. That turns a brief GekkoNet wait into a lost emulated frame. Dolphin's precision
     // timer spins for this short interval and preserves the intended 100 us polling cadence.
+    ++pump_retries;
+    const auto sleep_start = std::chrono::steady_clock::now();
     g_manager.wait_timer.SleepUntil(Clock::now() + std::chrono::microseconds(WAIT_SLEEP_US));
+    if (diagnose_pump_stalls)
+      pump_sleep_ms += ElapsedMs(sleep_start);
     PumpSimulatedPeer();
     if (!g_manager.netplay_replay_session)
+    {
+      const auto network_poll_start = std::chrono::steady_clock::now();
       gekko_network_poll(g_manager.session);
+      if (diagnose_pump_stalls)
+        pump_network_poll_ms += ElapsedMs(network_poll_start);
+    }
+    maybe_log_waiting_pump();
   }
 }
 
@@ -3333,12 +3774,7 @@ static bool SubmitNetplayReplayInputs()
 void OnFrameBoundary(const Core::CPUThreadGuard& guard)
 {
   ProcessFrameBoundary(guard, FrameBoundary::BrawlHook);
-  if (IsGekkoSessionActive() && g_manager.frame_boundary == FrameBoundary::BrawlHook &&
-      !IsResimulating())
-  {
-    auto& core_timing = guard.GetSystem().GetCoreTiming();
-    core_timing.ThrottleForRollbackBoundary(static_cast<s64>(core_timing.GetTicks()));
-  }
+  RecordGekkoInputGuestResume();
 }
 
 void SignalVIBoundary(FrameBoundary boundary)
@@ -3433,11 +3869,7 @@ void RunPendingVIBoundary(Core::System& system)
 
   const Core::CPUThreadGuard guard(system);
   ProcessFrameBoundary(guard, g_manager.frame_boundary);
-  if (IsGekkoSessionActive() && !IsResimulating())
-  {
-    auto& core_timing = system.GetCoreTiming();
-    core_timing.ThrottleForRollbackBoundary(static_cast<s64>(core_timing.GetTicks()));
-  }
+  RecordGekkoInputGuestResume();
   static u32 s_early_returns = 0;
   if (g_manager.stress_test && s_early_returns++ < 16)
   {

@@ -35,8 +35,15 @@ namespace Rollback
 {
 struct SnapshotPhaseTimings
 {
+  // Time spent waiting for the GPU/DSP execution barrier in dual-core mode. Time spent while the
+  // barrier is held is already represented by the individual snapshot phases below.
+  double execution_barrier_ms = 0.0;
   double state_ms = 0.0;
   double dirty_pages_ms = 0.0;
+  double dirty_bitmap_scan_ms = 0.0;
+  double dirty_compare_ms = 0.0;
+  double dirty_undo_log_ms = 0.0;
+  double dirty_mirror_copy_ms = 0.0;
   double l1_ms = 0.0;
   double jit_ms = 0.0;
   double journal_ms = 0.0;
@@ -44,6 +51,8 @@ struct SnapshotPhaseTimings
   std::size_t changed_blocks = 0;
   std::size_t changed_cache_lines = 0;
   std::size_t jit_blocks_invalidated = 0;
+  u64 dirty_marked_pages = 0;
+  u64 dirty_changed_pages = 0;
 };
 
 struct ResimJitCompileStats
@@ -97,8 +106,26 @@ struct ChangedMemoryRange
 struct RollbackBurstMarker
 {
   u64 serial = 0;
+  u64 start_time_ns = 0;
   u64 end_time_ns = 0;
   u64 duration_ns = 0;
+  u64 load_ns = 0;
+  u64 exec_ns = 0;
+  u64 save_ns = 0;
+  u64 other_ns = 0;
+  u32 replay_frames = 0;
+};
+
+struct FramePacingMarker
+{
+  u64 serial = 0;
+  u64 boundary_time_ns = 0;
+  u64 throttle_start_time_ns = 0;
+  u64 throttle_end_time_ns = 0;
+  u64 throttle_requested_ns = 0;
+  u64 throttle_actual_ns = 0;
+  s32 gekko_frame = 0;
+  bool follows_rollback = false;
 };
 
 // True while a rollback snapshot is being saved or loaded (CPU thread; single core only).
@@ -121,8 +148,13 @@ void RecordResimJitMemoryHelper(bool write, u64 nanoseconds);
 ResimJitMemoryStats TakeResimJitMemoryStats();
 void RecordResimEvent(ResimEventCategory category, u64 nanoseconds);
 ResimEventStats GetResimEventStats();
-void RecordRollbackBurst(u64 duration_ns);
+void RecordRollbackBurst(u64 duration_ns, u64 load_ns, u64 exec_ns, u64 save_ns, u64 other_ns,
+                         u32 replay_frames);
 RollbackBurstMarker GetLastRollbackBurst();
+void RecordFramePacingBoundary(s32 gekko_frame, bool follows_rollback);
+void RecordFramePacingThrottle(u64 start_time_ns, u64 end_time_ns, u64 requested_ns,
+                               u64 actual_ns);
+FramePacingMarker GetLastFramePacingMarker();
 
 // Holds InSnapshotDoState() true for its lifetime.
 class SnapshotScope

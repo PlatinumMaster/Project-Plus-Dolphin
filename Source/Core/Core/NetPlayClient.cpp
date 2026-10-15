@@ -98,6 +98,9 @@ NetPlayClient::~NetPlayClient()
   if (m_is_running.IsSet())
     StopGame();
 
+  if (m_presentation_pause_thread.joinable())
+    m_presentation_pause_thread.join();
+
   if (m_is_connected)
   {
     m_should_compute_game_digest = false;
@@ -676,7 +679,8 @@ void NetPlayClient::OnChunkedDataStart(sf::Packet& packet)
   packet >> title;
   const u64 data_size = Common::PacketReadU64(packet);
 
-  INFO_LOG_FMT(NETPLAY, "Starting data chunk {}.", cid);
+  NOTICE_LOG_FMT(NETPLAY, "Save sync transport: receiving chunk {} ('{}', {} bytes).", cid,
+                 title, data_size);
 
   m_chunked_data_receive_queue.emplace(cid, sf::Packet{});
 
@@ -697,7 +701,8 @@ void NetPlayClient::OnChunkedDataEnd(sf::Packet& packet)
     return;
   }
 
-  INFO_LOG_FMT(NETPLAY, "Ending data chunk {}.", cid);
+  NOTICE_LOG_FMT(NETPLAY, "Save sync transport: chunk {} complete ({} bytes received).", cid,
+                 data_packet_iter->second.getDataSize());
 
   auto& data_packet = data_packet_iter->second;
   OnData(data_packet);
@@ -1186,15 +1191,29 @@ void NetPlayClient::OnPresentationPauseBegin(sf::Packet& packet)
   }
 
   Core::SetState(system, Core::State::Paused, false, true);
-  {
-    // Do not acknowledge until the CPU has actually reached the paused state.
-    const Core::CPUThreadGuard guard(system);
-  }
 
-  sf::Packet response;
-  response << MessageID::PresentationPauseAck << generation << true;
-  Send(response);
-  INFO_LOG_FMT(NETPLAY, "Presentation pause {} acknowledged", generation);
+  // The CPU can be inside rollback code which needs the NetPlay receive thread to keep pumping
+  // packets before it can reach the pause.  Waiting for CPUThreadGuard here would block that receive
+  // thread and deadlock the pause handshake.  Verify the pause on a worker and keep receiving.
+  if (m_presentation_pause_thread.joinable())
+    m_presentation_pause_thread.join();
+  m_presentation_pause_thread = std::thread([this, generation] {
+    auto& worker_system = Core::System::GetInstance();
+    {
+      const Core::CPUThreadGuard guard(worker_system);
+    }
+
+    {
+      std::lock_guard lock(m_presentation_pause_mutex);
+      if (!m_presentation_pause_active || generation != m_presentation_pause_generation)
+        return;
+    }
+
+    sf::Packet response;
+    response << MessageID::PresentationPauseAck << generation << true;
+    SendAsync(std::move(response));
+    INFO_LOG_FMT(NETPLAY, "Presentation pause {} acknowledged", generation);
+  });
 }
 
 void NetPlayClient::OnPresentationPauseReady(sf::Packet& packet)
@@ -1358,7 +1377,8 @@ void NetPlayClient::OnSyncSaveDataNotify(sf::Packet& packet)
   m_wii_sync_redirect_folder.clear();
   m_wii_sync_data_ready = false;
 
-  INFO_LOG_FMT(NETPLAY, "Initializing wait for {} savegame chunks.", m_sync_save_data_count);
+  NOTICE_LOG_FMT(NETPLAY, "Save sync: client expects {} logical chunk(s).",
+                 m_sync_save_data_count);
 
   if (m_sync_save_data_count == 0)
   {
@@ -1500,7 +1520,8 @@ void NetPlayClient::OnSyncSaveDataWii(sf::Packet& packet)
   // Read the saves
   u32 save_count;
   packet >> save_count;
-  INFO_LOG_FMT(NETPLAY, "Received data for {} Wii saves.", save_count);
+  NOTICE_LOG_FMT(NETPLAY, "Save sync: received Wii payload containing {} title save(s).",
+                 save_count);
   for (u32 n = 0; n < save_count; n++)
   {
     u64 title_id = Common::PacketReadU64(packet);
@@ -2197,6 +2218,9 @@ bool NetPlayClient::StartGame(const std::string& path)
     // emulated SI port. Do not inherit a stale or user-edited Dolphin lobby mapping: GekkoNet's
     // player streams are indexed by these seats and are exposed directly through GetRollbackPad().
     boot_net_settings.pad_map.fill(0);
+    // Managed Brawlback sessions use Dolphin's deterministic dual-core CPU/GPU execution model.
+    // This is boot-local and does not alter the user's persistent Dolphin configuration.
+    boot_net_settings.cpu_thread = true;
     for (int seat = 1; seat <= m_managed_config->player_count; ++seat)
       boot_net_settings.pad_map[seat - 1] = static_cast<PlayerId>(seat);
   }
@@ -2239,6 +2263,9 @@ bool NetPlayClient::StartGame(const std::string& path)
 
 void NetPlayClient::SyncSaveDataResponse(const bool success)
 {
+  NOTICE_LOG_FMT(NETPLAY, "Save sync: processed logical chunk {}/{} (success={}).",
+                 success ? m_sync_save_data_success_count + 1 : m_sync_save_data_success_count,
+                 m_sync_save_data_count, success);
   m_dialog->AppendChat(success ? Common::GetStringT("Data received!") :
                                  Common::GetStringT("Error processing data."));
 

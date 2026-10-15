@@ -15,6 +15,8 @@
 
 #include "Common/FPURoundMode.h"
 #include "Common/Logging/Log.h"
+#include "Core/Core.h"
+#include "Core/DSPEmulator.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IOS/FS/HostBackend/FS.h"
@@ -26,6 +28,7 @@
 #include "Core/Rollback/DirtyPages.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "VideoCommon/Fifo.h"
 #include "VideoCommon/VideoState.h"
 
 namespace Rollback
@@ -40,8 +43,23 @@ std::atomic<u64> s_resim_jit_compile_blocks{0};
 std::atomic<u64> s_resim_jit_compile_nanoseconds{0};
 std::atomic<u64> s_rollback_burst_sequence{0};
 std::atomic<u64> s_rollback_burst_serial{0};
+std::atomic<u64> s_rollback_burst_start_time_ns{0};
 std::atomic<u64> s_rollback_burst_end_time_ns{0};
 std::atomic<u64> s_rollback_burst_duration_ns{0};
+std::atomic<u64> s_rollback_burst_load_ns{0};
+std::atomic<u64> s_rollback_burst_exec_ns{0};
+std::atomic<u64> s_rollback_burst_save_ns{0};
+std::atomic<u64> s_rollback_burst_other_ns{0};
+std::atomic<u32> s_rollback_burst_replay_frames{0};
+std::atomic<u64> s_frame_pacing_sequence{0};
+std::atomic<u64> s_frame_pacing_serial{0};
+std::atomic<u64> s_frame_pacing_boundary_time_ns{0};
+std::atomic<u64> s_frame_pacing_throttle_start_time_ns{0};
+std::atomic<u64> s_frame_pacing_throttle_end_time_ns{0};
+std::atomic<u64> s_frame_pacing_throttle_requested_ns{0};
+std::atomic<u64> s_frame_pacing_throttle_actual_ns{0};
+std::atomic<s32> s_frame_pacing_gekko_frame{0};
+std::atomic<bool> s_frame_pacing_follows_rollback{false};
 ResimEventStats s_resim_event_stats;
 std::unordered_map<u32, ResimGuestHotspot> s_resim_guest_hotspots;
 ResimJitMemoryStats s_resim_jit_memory_stats;
@@ -57,6 +75,46 @@ double MillisecondsSince(std::chrono::steady_clock::time_point start)
 {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
+
+// A rollback snapshot represents one emulated instant. Drain deterministic FIFO work and hold the
+// DSP lock across the complete Orca save or restore so the GPU and DSP cannot advance between the
+// serialized device state and RAM commit. The GPU loop stays alive to service blocking video-state
+// requests, but restored FIFO commands remain suspended until the whole snapshot operation ends.
+class SnapshotExecutionBarrier
+{
+public:
+  explicit SnapshotExecutionBarrier(Core::System& system) : m_system(system)
+  {
+    if (!system.IsDualCoreMode() || !Core::IsRunning(system))
+      return;
+
+    const auto start = std::chrono::steady_clock::now();
+    system.GetDSP().GetDSPEmulator()->PauseAndLock();
+    system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Other);
+    system.GetFifo().SetRollbackSnapshotExecutionSuspended(true);
+    m_wait_ms = MillisecondsSince(start);
+    m_active = true;
+  }
+
+  ~SnapshotExecutionBarrier()
+  {
+    if (!m_active)
+      return;
+
+    m_system.GetFifo().SetRollbackSnapshotExecutionSuspended(false);
+    m_system.GetDSP().GetDSPEmulator()->UnpauseAndUnlock();
+  }
+
+  SnapshotExecutionBarrier(const SnapshotExecutionBarrier&) = delete;
+  SnapshotExecutionBarrier& operator=(const SnapshotExecutionBarrier&) = delete;
+
+  double WaitMilliseconds() const { return m_wait_ms; }
+
+private:
+  Core::System& m_system;
+  bool m_active = false;
+  double m_wait_ms = 0.0;
+};
 
 void HashRamPages(const u8* data, std::size_t size, std::vector<u64>* hashes)
 {
@@ -299,6 +357,11 @@ bool IsResimulating()
 
 void SetResimulating(bool resimulating)
 {
+  const bool changed = s_resimulating.load(std::memory_order_relaxed) != resimulating;
+  auto& system = Core::System::GetInstance();
+  if (changed && system.IsDualCoreMode() && Core::IsRunning(system))
+    system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Other);
+
   s_resimulating.store(resimulating, std::memory_order_relaxed);
   VideoCommon_SetSkipRender(resimulating);
 }
@@ -323,14 +386,21 @@ void SetCoarseFifoTiming(bool enabled)
   s_coarse_fifo_timing.store(enabled, std::memory_order_relaxed);
 }
 
-void RecordRollbackBurst(u64 duration_ns)
+void RecordRollbackBurst(u64 duration_ns, u64 load_ns, u64 exec_ns, u64 save_ns, u64 other_ns,
+                         u32 replay_frames)
 {
   const u64 end_time_ns = static_cast<u64>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
   s_rollback_burst_sequence.fetch_add(1, std::memory_order_acq_rel);
+  s_rollback_burst_start_time_ns.store(end_time_ns - duration_ns, std::memory_order_relaxed);
   s_rollback_burst_duration_ns.store(duration_ns, std::memory_order_relaxed);
+  s_rollback_burst_load_ns.store(load_ns, std::memory_order_relaxed);
+  s_rollback_burst_exec_ns.store(exec_ns, std::memory_order_relaxed);
+  s_rollback_burst_save_ns.store(save_ns, std::memory_order_relaxed);
+  s_rollback_burst_other_ns.store(other_ns, std::memory_order_relaxed);
+  s_rollback_burst_replay_frames.store(replay_frames, std::memory_order_relaxed);
   s_rollback_burst_end_time_ns.store(end_time_ns, std::memory_order_relaxed);
   s_rollback_burst_serial.fetch_add(1, std::memory_order_relaxed);
   s_rollback_burst_sequence.fetch_add(1, std::memory_order_release);
@@ -345,9 +415,68 @@ RollbackBurstMarker GetLastRollbackBurst()
     if ((sequence_before & 1) != 0)
       continue;
     marker.serial = s_rollback_burst_serial.load(std::memory_order_relaxed);
+    marker.start_time_ns = s_rollback_burst_start_time_ns.load(std::memory_order_relaxed);
     marker.end_time_ns = s_rollback_burst_end_time_ns.load(std::memory_order_relaxed);
     marker.duration_ns = s_rollback_burst_duration_ns.load(std::memory_order_relaxed);
+    marker.load_ns = s_rollback_burst_load_ns.load(std::memory_order_relaxed);
+    marker.exec_ns = s_rollback_burst_exec_ns.load(std::memory_order_relaxed);
+    marker.save_ns = s_rollback_burst_save_ns.load(std::memory_order_relaxed);
+    marker.other_ns = s_rollback_burst_other_ns.load(std::memory_order_relaxed);
+    marker.replay_frames = s_rollback_burst_replay_frames.load(std::memory_order_relaxed);
     const u64 sequence_after = s_rollback_burst_sequence.load(std::memory_order_acquire);
+    if (sequence_before == sequence_after)
+      return marker;
+  }
+}
+
+void RecordFramePacingBoundary(s32 gekko_frame, bool follows_rollback)
+{
+  const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+  s_frame_pacing_sequence.fetch_add(1, std::memory_order_acq_rel);
+  s_frame_pacing_boundary_time_ns.store(now_ns, std::memory_order_relaxed);
+  s_frame_pacing_throttle_start_time_ns.store(0, std::memory_order_relaxed);
+  s_frame_pacing_throttle_end_time_ns.store(0, std::memory_order_relaxed);
+  s_frame_pacing_throttle_requested_ns.store(0, std::memory_order_relaxed);
+  s_frame_pacing_throttle_actual_ns.store(0, std::memory_order_relaxed);
+  s_frame_pacing_gekko_frame.store(gekko_frame, std::memory_order_relaxed);
+  s_frame_pacing_follows_rollback.store(follows_rollback, std::memory_order_relaxed);
+  s_frame_pacing_serial.fetch_add(1, std::memory_order_relaxed);
+  s_frame_pacing_sequence.fetch_add(1, std::memory_order_release);
+}
+
+void RecordFramePacingThrottle(u64 start_time_ns, u64 end_time_ns, u64 requested_ns, u64 actual_ns)
+{
+  s_frame_pacing_sequence.fetch_add(1, std::memory_order_acq_rel);
+  s_frame_pacing_throttle_start_time_ns.store(start_time_ns, std::memory_order_relaxed);
+  s_frame_pacing_throttle_end_time_ns.store(end_time_ns, std::memory_order_relaxed);
+  s_frame_pacing_throttle_requested_ns.store(requested_ns, std::memory_order_relaxed);
+  s_frame_pacing_throttle_actual_ns.store(actual_ns, std::memory_order_relaxed);
+  s_frame_pacing_sequence.fetch_add(1, std::memory_order_release);
+}
+
+FramePacingMarker GetLastFramePacingMarker()
+{
+  FramePacingMarker marker;
+  while (true)
+  {
+    const u64 sequence_before = s_frame_pacing_sequence.load(std::memory_order_acquire);
+    if ((sequence_before & 1) != 0)
+      continue;
+    marker.serial = s_frame_pacing_serial.load(std::memory_order_relaxed);
+    marker.boundary_time_ns = s_frame_pacing_boundary_time_ns.load(std::memory_order_relaxed);
+    marker.throttle_start_time_ns =
+        s_frame_pacing_throttle_start_time_ns.load(std::memory_order_relaxed);
+    marker.throttle_end_time_ns =
+        s_frame_pacing_throttle_end_time_ns.load(std::memory_order_relaxed);
+    marker.throttle_requested_ns =
+        s_frame_pacing_throttle_requested_ns.load(std::memory_order_relaxed);
+    marker.throttle_actual_ns = s_frame_pacing_throttle_actual_ns.load(std::memory_order_relaxed);
+    marker.gekko_frame = s_frame_pacing_gekko_frame.load(std::memory_order_relaxed);
+    marker.follows_rollback =
+        s_frame_pacing_follows_rollback.load(std::memory_order_relaxed);
+    const u64 sequence_after = s_frame_pacing_sequence.load(std::memory_order_acquire);
     if (sequence_before == sequence_after)
       return marker;
   }
@@ -550,6 +679,8 @@ bool SnapshotRing::Save(Core::System& system, s64 frame)
   if (trace)
     NOTICE_LOG_FMT(CORE, "Rollback trace: save frame {} begin", frame);
   m_last_save_timings = {};
+  SnapshotExecutionBarrier execution_barrier(system);
+  m_last_save_timings.execution_barrier_ms = execution_barrier.WaitMilliseconds();
   // Re-saving a frame after a rewind reuses its slot; otherwise take the next one.
   Slot* slot = Find(frame);
   const bool compare_replayed_frame =
@@ -607,6 +738,13 @@ bool SnapshotRing::Save(Core::System& system, s64 frame)
   {
     const auto phase_start = std::chrono::steady_clock::now();
     slot->page_snapshot_id = DirtyPages::Snapshot(frame);
+    const DirtyPages::CommitTimings commit_timings = DirtyPages::GetLastCommitTimings();
+    m_last_save_timings.dirty_bitmap_scan_ms = commit_timings.bitmap_scan_ms;
+    m_last_save_timings.dirty_compare_ms = commit_timings.compare_ms;
+    m_last_save_timings.dirty_undo_log_ms = commit_timings.undo_log_ms;
+    m_last_save_timings.dirty_mirror_copy_ms = commit_timings.mirror_copy_ms;
+    m_last_save_timings.dirty_marked_pages = commit_timings.marked_pages;
+    m_last_save_timings.dirty_changed_pages = commit_timings.changed_pages;
     if (trace)
       NOTICE_LOG_FMT(CORE, "Rollback trace: save frame {} dirty commit done (id={})", frame,
                      slot->page_snapshot_id);
@@ -709,6 +847,8 @@ bool SnapshotRing::LoadSlot(Core::System& system, s64 frame, bool redisplay)
   if (trace)
     NOTICE_LOG_FMT(CORE, "Rollback trace: load frame {} begin", frame);
   m_last_load_timings = {};
+  SnapshotExecutionBarrier execution_barrier(system);
+  m_last_load_timings.execution_barrier_ms = execution_barrier.WaitMilliseconds();
   Slot* slot = Find(frame);
   if (!slot || slot->state_size == 0)
   {
@@ -864,6 +1004,7 @@ bool SnapshotRing::LoadSlot(Core::System& system, s64 frame, bool redisplay)
 
 bool SnapshotRing::Capture(Core::System& system, MachineImage* image, bool stop_journal)
 {
+  SnapshotExecutionBarrier execution_barrier(system);
   Common::UniqueBuffer<u8> state;
   std::size_t state_size;
   {
