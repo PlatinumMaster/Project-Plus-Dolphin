@@ -12,8 +12,7 @@ runs:
       shell: bash
       run: |
         echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-        args=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CONFIGURATION_TYPES=Release
-              -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+        args=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
         case "$RUNNER_OS" in
           Windows) args+=(-G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl) ;;
           macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
@@ -38,18 +37,13 @@ runs:
       if: steps.libraries.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        if [ "$RUNNER_OS" = Windows ]; then
-          build_jobs="$NUMBER_OF_PROCESSORS"
-        else
-          build_jobs="$(getconf _NPROCESSORS_ONLN)"
-        fi
-        cmake --build build-dependency-work --config Release --parallel "$build_jobs"
-        cmake --install build-dependency-work --config Release
+        cmake --build build-dependency-work
+        cmake --install build-dependency-work
 
     - name: Verify installed dependency libraries
       shell: bash
       run: |
-        args=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CONFIGURATION_TYPES=Release)
+        args=(-DCMAKE_BUILD_TYPE=Release)
         case "$RUNNER_OS" in
           Windows) args+=(-G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl) ;;
           macOS) args+=(-G Ninja -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
@@ -59,8 +53,8 @@ runs:
         esac
         cmake -S CMake/DependencyBundle/Smoke -B build-dependency-smoke "${args[@]}" \
           -DDOLPHIN_DEPENDENCY_PREFIX="$GITHUB_WORKSPACE/build-dependency-prefix"
-        cmake --build build-dependency-smoke --config Release --parallel 2
-        ctest --test-dir build-dependency-smoke -C Release --output-on-failure --no-tests=error
+        cmake --build build-dependency-smoke
+        ctest --test-dir build-dependency-smoke --output-on-failure --no-tests=error
 
     # Cache immediately after the library link/runtime check passes, even if a
     # later Dolphin compile or packaging step fails.
