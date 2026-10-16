@@ -1,5 +1,7 @@
 name: Intel macOS verification
 on:
+  push:
+    branches: [ci/verify-intel-macos-20261016-043709]
   workflow_dispatch:
 permissions:
   contents: read
